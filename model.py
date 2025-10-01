@@ -32,63 +32,57 @@ class QTrainer:
         self.target_model = target_model  # target network
         self.tau = tau
         self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
-        self.criterion = nn.SmoothL1Loss(reduction="none")  # Huber Loss (no reduction)
 
     def train_step(self, state, action, reward, next_state, done, weights=None):
         """
-        Nếu dùng PER:
-        - weights: importance-sampling weights
-        Trả về (loss_mean, td_errors)
+        state: [B, state_dim]
+        action: [B] (int)
+        reward: [B]
+        next_state: [B, state_dim]
+        done: [B]
+        weights: [B] (PER IS weights) hoặc None
         """
-        state = torch.tensor(state, dtype=torch.float)
-        next_state = torch.tensor(next_state, dtype=torch.float)
-        action = torch.tensor(action, dtype=torch.long)
-        reward = torch.tensor(reward, dtype=torch.float)
+        device = next(self.model.parameters()).device
+        state = torch.tensor(state, dtype=torch.float, device=device)
+        next_state = torch.tensor(next_state, dtype=torch.float, device=device)
+        action = torch.tensor(action, dtype=torch.long, device=device)
+        reward = torch.tensor(reward, dtype=torch.float, device=device)
+        done = torch.tensor(done, dtype=torch.float, device=device)
 
-        if len(state.shape) == 1:
-            state = torch.unsqueeze(state, 0)
-            next_state = torch.unsqueeze(next_state, 0)
-            action = torch.unsqueeze(action, 0)
-            reward = torch.unsqueeze(reward, 0)
-            done = (done, )
+        # Q(s,a) hiện tại
+        q_values = self.model(state)                       # [B, n_actions]
+        q_pred = q_values.gather(1, action.unsqueeze(1)).squeeze(1)  # [B]
 
-        pred = self.model(state)  # Q(s,·)
-        target = pred.clone().detach()  # detach để không backprop vào đây
+        # Q target
+        with torch.no_grad():
+            if self.target_model is not None:
+                # Double DQN: chọn argmax bằng online, value bằng target
+                next_q_online = self.model(next_state)
+                next_actions = torch.argmax(next_q_online, dim=1, keepdim=True)  # [B,1]
+                next_q_target = self.target_model(next_state)
+                next_q = next_q_target.gather(1, next_actions).squeeze(1)        # [B]
+            else:
+                next_q = self.model(next_state).max(1)[0]                        # [B]
 
-        td_errors = []
-        for idx in range(len(done)):
-            Q_new = reward[idx]
-            if not done[idx]:
-                next_Q = self.target_model(next_state[idx]) if self.target_model else self.model(next_state[idx])
-                Q_new = reward[idx] + self.gamma * torch.max(next_Q)
+            q_target = reward + (1 - done) * self.gamma * next_q
 
-            a = torch.argmax(action[idx]).item()
-            td_error = Q_new - pred[idx][a]
-            td_errors.append(td_error.detach().cpu())
+        td_errors = (q_target - q_pred).detach()
 
-            target[idx][a] = Q_new
+        # Huber loss per sample
+        loss_per_sample = F.smooth_l1_loss(q_pred, q_target, reduction='none')
 
-        td_errors = torch.stack(td_errors)
-
-        # Loss cho từng sample
-        losses = self.criterion(pred, target)
-
-        # Nếu có importance-sampling weights → áp dụng
         if weights is not None:
-            weights = weights.unsqueeze(1)  # broadcast
-            losses = losses * weights
-
-        loss = losses.mean()
+            weights = torch.tensor(weights, dtype=torch.float, device=device)
+            loss = (loss_per_sample * weights).mean()
+        else:
+            loss = loss_per_sample.mean()
 
         self.optimizer.zero_grad()
         loss.backward()
-
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
         self.optimizer.step()
 
-        return loss.item(), td_errors  # trả về cho PER update priority
+        return loss.item(), td_errors.cpu().numpy()
 
     def soft_update_target(self):
         """Soft update target network"""

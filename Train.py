@@ -1,7 +1,9 @@
-# Train.py (final, obs-driven)
 import torch
 import random
 import numpy as np
+import matplotlib.pyplot as plt
+from collections import deque
+
 from environment import SnakeEnv
 from model import Linear_QNet, QTrainer
 
@@ -11,10 +13,11 @@ from model import Linear_QNet, QTrainer
 MAX_MEMORY = 100_000
 BATCH_SIZE = 256
 LR = 0.001
-STATE_SIZE = 16   # CHANGED: đúng bằng số feature từ Snake.observation()
+STATE_SIZE = 16
 HIDDEN_SIZE = 256
 ACTION_SIZE = 3
 GAMMA = 0.95
+
 
 # =========================
 # Prioritized Replay Buffer
@@ -28,7 +31,6 @@ class PrioritizedReplayBuffer:
         self.pos = 0
 
     def push(self, transition, error=None):
-        """transition = (state, action, reward, next_state, done)"""
         max_prio = self.priorities.max() if len(self.buffer) > 0 else 1.0
         prio = abs(error) + 1e-6 if error is not None else max_prio
 
@@ -63,6 +65,7 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
 
 # =========================
 # Agent
@@ -116,7 +119,7 @@ class Agent:
             prediction = self.model(state0)
             move = torch.argmax(prediction).item()
             final_move[move] = 1
-        return final_move
+        return final_move  # vẫn trả về one-hot để dùng cho action_to_direction
 
     def train_long_memory(self):
         if len(self.memory) < self.batch_size:
@@ -126,28 +129,33 @@ class Agent:
         mini_sample, indices, weights, _ = self.memory.sample(self.batch_size, beta=beta)
         states, actions, rewards, next_states, dones = zip(*mini_sample)
 
+        # convert one-hot -> index
+        actions = [int(np.argmax(a)) if isinstance(a, (list, np.ndarray)) else int(a) for a in actions]
+
         loss, td_errors = self.trainer.train_step(states, actions, rewards,
                                                   next_states, dones, weights=weights)
-        td_errs_np = td_errors.detach().cpu().numpy()
-        self.memory.update_priorities(indices, td_errs_np)
+        self.memory.update_priorities(indices, td_errors)
         return loss
 
     def train_short_memory(self, state, action, reward, next_state, done):
+        # convert one-hot -> index
+        if isinstance(action, (list, np.ndarray)):
+            action = int(np.argmax(action))
         loss, td_errors = self.trainer.train_step([state], [action], [reward],
                                                   [next_state], [done], weights=None)
         try:
-            err = td_errors.detach().cpu().numpy()[0]
+            err = td_errors[0]
         except Exception:
             err = None
         self.remember(state, action, reward, next_state, done, error=err)
         return loss
 
+
 # =========================
 # Helpers
 # =========================
 def action_to_direction(action, current_dir):
-    # clockwise order = [0,3,1,2] (up, right, down, left)
-    clock_wise = [0, 3, 1, 2]
+    clock_wise = [0, 3, 1, 2]  # up, right, down, left
     idx = clock_wise.index(current_dir)
     if np.array_equal(action, [1, 0, 0]):  # straight
         new_dir = clock_wise[idx]
@@ -157,10 +165,11 @@ def action_to_direction(action, current_dir):
         new_dir = clock_wise[(idx - 1) % 4]
     return new_dir
 
+
 # =========================
-# Training Loop
+# Training Loop with live plot
 # =========================
-def train(num_episodes=3000, phase=1, load_model=False, model_path="dqn_snake_per.pth"):
+def train(num_episodes=3000, phase=1, load_model=False, model_path=None):
     if phase == 1:
         w, h = 10, 10
     elif phase == 2:
@@ -184,11 +193,7 @@ def train(num_episodes=3000, phase=1, load_model=False, model_path="dqn_snake_pe
     }
 
     env = SnakeEnv(render_mode=None, **options)
-    agent = Agent(state_size=STATE_SIZE,
-                  hidden_size=HIDDEN_SIZE,
-                  action_size=ACTION_SIZE,
-                  lr=LR,
-                  gamma=GAMMA)
+    agent = Agent()
 
     device = torch.device("cuda" if (load_model and torch.cuda.is_available()) else "cpu")
     if load_model and model_path:
@@ -199,7 +204,15 @@ def train(num_episodes=3000, phase=1, load_model=False, model_path="dqn_snake_pe
         except Exception as e:
             print(f"Could not load model: {e}. Starting fresh.")
 
-    record = 0
+    # Logging
+    scores_window = deque(maxlen=100)
+    record, best_avg = 0, -float("inf")
+    log = {"score": [], "avg_score": [], "reward": [], "eps": [], "loss": []}
+
+    # Setup live plotting
+    plt.ion()
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+
     for episode in range(1, num_episodes + 1):
         obs, info = env.reset()
         state_old = np.array(obs, dtype=float)
@@ -222,18 +235,54 @@ def train(num_episodes=3000, phase=1, load_model=False, model_path="dqn_snake_pe
         loss = agent.train_long_memory()
         agent.trainer.soft_update_target()
 
+        scores_window.append(env.snake.score)
+        avg_score = np.mean(scores_window)
+
+        # Save models
         if env.snake.score > record:
             record = env.snake.score
-            agent.model.save(f"dqn_snake_phase{phase}.pth")
+            agent.model.save(f"dqn_snake_phase{phase}_record.pth")
+
+        if avg_score > best_avg and len(scores_window) == scores_window.maxlen:
+            best_avg = avg_score
+            agent.model.save(f"dqn_snake_phase{phase}_best.pth")
+
+        # Logging
+        log["score"].append(env.snake.score)
+        log["avg_score"].append(avg_score)
+        log["reward"].append(total_reward)
+        log["eps"].append(agent.epsilon)
+        log["loss"].append(loss if loss is not None else np.nan)
+
+        # Update live plots
+        axs[0, 0].cla(); axs[0, 0].plot(log["score"], label="Score")
+        axs[0, 0].plot(log["avg_score"], label="Avg(100)")
+        axs[0, 0].set_title("Score"); axs[0, 0].legend()
+
+        axs[0, 1].cla(); axs[0, 1].plot(log["reward"])
+        axs[0, 1].set_title("Reward")
+
+        axs[1, 0].cla(); axs[1, 0].plot(log["loss"])
+        axs[1, 0].set_title("Loss")
+
+        axs[1, 1].cla(); axs[1, 1].plot(log["eps"])
+        axs[1, 1].set_title("Epsilon")
+
+        plt.pause(0.01)
 
         print(
-            f"Episode {episode}/{num_episodes} | Score: {env.snake.score} | Record: {record} | Reward: {total_reward:.3f} | Eps: {agent.epsilon:.4f} | Loss: {loss if loss is not None else 'N/A'}"
+            f"Ep {episode}/{num_episodes} | Score: {env.snake.score} | "
+            f"Avg: {avg_score:.2f} | BestAvg: {best_avg:.2f} | "
+            f"Record: {record} | Reward: {total_reward:.1f} | "
+            f"Eps: {agent.epsilon:.4f} | Loss: {loss if loss is not None else 'N/A'}"
         )
 
     env.close()
+    plt.ioff()
+    plt.show()
 
 
 if __name__ == "__main__":
-    train(num_episodes=20000, phase=2,
+    train(num_episodes=20000, phase=3,
           load_model=True,
-          model_path="D:\\AL_FINAL_PROJECT_LAST_WEEK\\AI_LAST_VER\\model\\dqn_snake_per.pth")
+          model_path="D:\\AL_FINAL_PROJECT_LAST_WEEK\\AI_LAST_VER\\model\\dqn_snake_phase2_best.pth")
