@@ -24,59 +24,22 @@ class Linear_QNet(nn.Module):
         torch.save(self.state_dict(), file_name)
 
 
-# class QTrainer:
-#     def __init__(self, model, lr, gamma):
-#         self.lr = lr
-#         self.gamma = gamma
-#         self.model = model
-#         self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
-#         self.criterion = nn.MSELoss()
-
-#     def train_step(self, state, action, reward, next_state, done):
-#         state = torch.tensor(state, dtype=torch.float)
-#         next_state = torch.tensor(next_state, dtype=torch.float)
-#         action = torch.tensor(action, dtype=torch.long)
-#         reward = torch.tensor(reward, dtype=torch.float)
-#         # (n, x)
-
-#         if len(state.shape) == 1:
-#             # (1, x)
-#             state = torch.unsqueeze(state, 0)
-#             next_state = torch.unsqueeze(next_state, 0)
-#             action = torch.unsqueeze(action, 0)
-#             reward = torch.unsqueeze(reward, 0)
-#             done = (done, )
-
-#         # 1: predicted Q values with current state
-#         pred = self.model(state)
-
-#         target = pred.clone()
-#         for idx in range(len(done)):
-#             Q_new = reward[idx]
-#             if not done[idx]:
-#                 Q_new = reward[idx] + self.gamma * torch.max(self.model(next_state[idx]))
-
-#             target[idx][torch.argmax(action[idx]).item()] = Q_new
-    
-#         # 2: Q_new = r + y * max(next_predicted Q value) -> only do this if not done
-#         # pred.clone()
-#         # preds[argmax(action)] = Q_new
-#         self.optimizer.zero_grad()
-#         loss = self.criterion(target, pred)
-#         loss.backward()
-
-#         self.optimizer.step()
 class QTrainer:
     def __init__(self, model, lr, gamma, target_model=None, tau=0.01):
         self.lr = lr
         self.gamma = gamma
         self.model = model
-        self.target_model = target_model  # Thêm target network
-        self.tau = tau  # hệ số soft update
+        self.target_model = target_model  # target network
+        self.tau = tau
         self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
-        self.criterion = nn.SmoothL1Loss()  # Huber Loss
+        self.criterion = nn.SmoothL1Loss(reduction="none")  # Huber Loss (no reduction)
 
-    def train_step(self, state, action, reward, next_state, done):
+    def train_step(self, state, action, reward, next_state, done, weights=None):
+        """
+        Nếu dùng PER:
+        - weights: importance-sampling weights
+        Trả về (loss_mean, td_errors)
+        """
         state = torch.tensor(state, dtype=torch.float)
         next_state = torch.tensor(next_state, dtype=torch.float)
         action = torch.tensor(action, dtype=torch.long)
@@ -89,20 +52,35 @@ class QTrainer:
             reward = torch.unsqueeze(reward, 0)
             done = (done, )
 
-        pred = self.model(state)
+        pred = self.model(state)  # Q(s,·)
+        target = pred.clone().detach()  # detach để không backprop vào đây
 
-        target = pred.clone()
+        td_errors = []
         for idx in range(len(done)):
             Q_new = reward[idx]
             if not done[idx]:
-                # Dùng target network nếu có
                 next_Q = self.target_model(next_state[idx]) if self.target_model else self.model(next_state[idx])
                 Q_new = reward[idx] + self.gamma * torch.max(next_Q)
 
-            target[idx][torch.argmax(action[idx]).item()] = Q_new
+            a = torch.argmax(action[idx]).item()
+            td_error = Q_new - pred[idx][a]
+            td_errors.append(td_error.detach().cpu())
+
+            target[idx][a] = Q_new
+
+        td_errors = torch.stack(td_errors)
+
+        # Loss cho từng sample
+        losses = self.criterion(pred, target)
+
+        # Nếu có importance-sampling weights → áp dụng
+        if weights is not None:
+            weights = weights.unsqueeze(1)  # broadcast
+            losses = losses * weights
+
+        loss = losses.mean()
 
         self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
         loss.backward()
 
         # Gradient clipping
@@ -110,13 +88,11 @@ class QTrainer:
 
         self.optimizer.step()
 
+        return loss.item(), td_errors  # trả về cho PER update priority
+
     def soft_update_target(self):
-        """Soft update: target_model = tau*model + (1-tau)*target_model"""
+        """Soft update target network"""
         if self.target_model is None:
             return
         for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-
-
-
-

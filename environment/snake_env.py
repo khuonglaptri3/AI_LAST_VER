@@ -1,6 +1,7 @@
 import gymnasium
 from gymnasium import spaces
 from .core import Snake
+import numpy as np
 
 
 class SnakeEnv(gymnasium.Env):
@@ -10,8 +11,7 @@ class SnakeEnv(gymnasium.Env):
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(4)
         self.snake = Snake(**kwargs)
-        self.observation_space = spaces.Box(
-            0, 1, shape=(self.snake.blocks_x, self.snake.blocks_y, 3))
+        self.observation_space = spaces.Box(0, 1, shape=(16,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         self.snake.init()

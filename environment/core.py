@@ -9,10 +9,10 @@ class Snake:
         fps=60,
         max_step=200,
         init_length=4,
-        food_reward=1.0,
-        dist_reward=0.0,
-        living_bonus=0.0,
-        death_penalty=-10.0,
+        food_reward=10.0,          # thưởng ăn food mạnh hơn
+        dist_reward=1.0,           # bật shaping theo khoảng cách
+        living_bonus=-0.01,        # penalty nhỏ mỗi bước
+        death_penalty=-50.0,       # phạt chết nặng hơn
         width=16,
         height=16,
         block_size=20,
@@ -46,13 +46,16 @@ class Snake:
     def init(self):
         self.episode += 1
         self.score = 0
-        self.direction = 3
+        self.direction = 3  # right
         self.current_step = 0
         self.head = Block(self.blocks_x//2, self.blocks_y//2, self.head_color)
         self.body = [self.head.copy(i, 0, self.body_color)
                      for i in range(-self.init_length, 0)]
         self.blocks = [self.food.block, self.head, *self.body]
         self.food.new_food(self.blocks)
+
+        # Dynamic max_step
+        self.max_step = 50 * len(self.body)
 
     def close(self):
         pygame.quit()
@@ -72,19 +75,20 @@ class Snake:
         if direction is None:
             direction = self.direction
         self.current_step += 1
-        truncated = True if self.current_step == self.max_step else False
+        truncated = True if self.current_step >= self.max_step else False
+
         (x, y) = (self.head.x, self.head.y)
         step = Direction.step(direction)
-        if (direction == 0 or direction == 1) and (self.direction == 0 or self.direction == 1):
+        if (direction in [0, 1]) and (self.direction in [0, 1]):
             step = Direction.step(self.direction)
-        elif (direction == 2 or direction == 3) and (self.direction == 2 or self.direction == 3):
+        elif (direction in [2, 3]) and (self.direction in [2, 3]):
             step = Direction.step(self.direction)
         else:
             self.direction = direction
         self.head.x += step[0]
         self.head.y += step[1]
 
-        reward = self.living_bonus + self.calc_reward()
+        reward = self.living_bonus
         dead = False
 
         if self.head == self.food.block:
@@ -92,52 +96,95 @@ class Snake:
             self.grow(x, y)
             self.food.new_food(self.blocks)
             reward = self.food_reward
+            # reset step count khi ăn được food
+            self.current_step = 0
+            self.max_step = 50 * len(self.body)
         else:
+            # distance shaping
+            old_dist = math.dist((x, y), (self.food.block.x, self.food.block.y))
+            new_dist = math.dist((self.head.x, self.head.y),
+                                 (self.food.block.x, self.food.block.y))
+            if new_dist < old_dist:
+                reward += 0.1
+            else:
+                reward -= 0.05
+
             self.move(x, y)
             for block in self.body:
                 if self.head == block:
                     dead = True
-            if self.head.x >= self.blocks_x or self.head.x < 0 or self.head.y < 0 or self.head.y >= self.blocks_x:
+            if (self.head.x >= self.blocks_x or self.head.x < 0 or
+                self.head.y < 0 or self.head.y >= self.blocks_y):
                 dead = True
+
         if dead:
             reward = self.death_penalty
+
         return self.observation(), reward, dead, truncated
 
     def observation(self):
-        obs = np.zeros((self.blocks_x, self.blocks_y, 3), dtype=np.float32)
-        if 0 <= self.head.x < self.blocks_x and 0 <= self.head.y < self.blocks_y:
-            obs[self.head.x][self.head.y][0] = 1
-        for block in self.blocks:
-            if 0 <= block.x < self.blocks_x and 0 <= block.y < self.blocks_y:
-                obs[block.x][block.y][1] = 1
-        obs[self.food.block.x][self.food.block.y][2] = 1
-        return obs
+        """Trả về vector 15 features (thay vì grid 3 kênh)."""
+        head_x, head_y = self.head.x, self.head.y
+        dir = self.direction
+
+        # danger detection
+        def collision(p):
+            x, y = p
+            if x < 0 or x >= self.blocks_x or y < 0 or y >= self.blocks_y:
+                return True
+            for b in self.body:
+                if (b.x, b.y) == (x, y):
+                    return True
+            return False
+
+        point_l = (head_x - 1, head_y)
+        point_r = (head_x + 1, head_y)
+        point_u = (head_x, head_y - 1)
+        point_d = (head_x, head_y + 1)
+
+        dir_l = dir == 2
+        dir_r = dir == 3
+        dir_u = dir == 0
+        dir_d = dir == 1
+
+        danger_straight = (dir_r and collision(point_r)) or \
+                          (dir_l and collision(point_l)) or \
+                          (dir_u and collision(point_u)) or \
+                          (dir_d and collision(point_d))
+
+        danger_right = (dir_u and collision(point_r)) or \
+                       (dir_d and collision(point_l)) or \
+                       (dir_l and collision(point_u)) or \
+                       (dir_r and collision(point_d))
+
+        danger_left = (dir_d and collision(point_r)) or \
+                      (dir_u and collision(point_l)) or \
+                      (dir_r and collision(point_u)) or \
+                      (dir_l and collision(point_d))
+
+        food_left = self.food.block.x < head_x
+        food_right = self.food.block.x > head_x
+        food_up = self.food.block.y < head_y
+        food_down = self.food.block.y > head_y
+
+        # extra normalized features
+        dx = (self.food.block.x - head_x) / max(1, self.blocks_x - 1)
+        dy = (self.food.block.y - head_y) / max(1, self.blocks_y - 1)
+        snake_len = len(self.body) / float(self.blocks_x * self.blocks_y)
+        head_norm_x = head_x / max(1, self.blocks_x - 1)
+        head_norm_y = head_y / max(1, self.blocks_y - 1)
+
+        state = [
+            danger_straight, danger_right, danger_left,
+            dir_l, dir_r, dir_u, dir_d,
+            food_left, food_right, food_up, food_down,
+            dx, dy, snake_len, head_norm_x, head_norm_y,
+        ]
+        return np.array(state, dtype=np.float32)
 
     def calc_reward(self):
-        reward = 0.0
-
-        # shaping reward theo khoảng cách (có sẵn)
-        if self.dist_reward != 0.0:
-            x = self.head.x - self.food.block.x
-            y = self.head.y - self.food.block.y
-            d = math.sqrt(x*x + y*y)
-            reward += (self.dist_reward - d) / self.dist_reward
-
-        # --- NEW: shaping reward theo hướng đi ---
-        # vector từ đầu rắn tới food
-        food_vec = np.array([self.food.block.x - self.head.x,
-                            self.food.block.y - self.head.y], dtype=np.float32)
-        # vector hướng di chuyển hiện tại
-        dir_vec = np.array(Direction.step(self.direction), dtype=np.float32)
-
-        if np.linalg.norm(food_vec) > 0:
-            cos_theta = np.dot(dir_vec, food_vec) / (
-                np.linalg.norm(dir_vec) * np.linalg.norm(food_vec)
-            )
-            reward += 0.1 * cos_theta   # hệ số 0.1 để không quá mạnh
-
-        return reward
-
+        # đã xử lý trong step()
+        return 0.0
 
     def grow(self, x, y):
         body = Block(x, y, self.body_color)

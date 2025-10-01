@@ -1,210 +1,239 @@
+# Train.py (final, obs-driven)
 import torch
 import random
 import numpy as np
-from collections import deque
 from environment import SnakeEnv
 from model import Linear_QNet, QTrainer
-from environment.utils import Direction
 
+# =========================
+# Config
+# =========================
 MAX_MEMORY = 100_000
-BATCH_SIZE = 1000
+BATCH_SIZE = 256
 LR = 0.001
+STATE_SIZE = 16   # CHANGED: đúng bằng số feature từ Snake.observation()
+HIDDEN_SIZE = 256
+ACTION_SIZE = 3
+GAMMA = 0.95
 
+# =========================
+# Prioritized Replay Buffer
+# =========================
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity=MAX_MEMORY, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
 
-class Agent:
-    def __init__(self, state_size=11, hidden_size=256, action_size=3):
-        self.n_games = 0
-        self.epsilon = 1.0  # ban đầu full exploration
-        self.gamma = 0.9
-        self.memory = deque(maxlen=MAX_MEMORY)
+    def push(self, transition, error=None):
+        """transition = (state, action, reward, next_state, done)"""
+        max_prio = self.priorities.max() if len(self.buffer) > 0 else 1.0
+        prio = abs(error) + 1e-6 if error is not None else max_prio
 
-        # Online model
-        self.model = Linear_QNet(state_size, hidden_size, action_size)
-
-        # Target model
-        self.target_model = Linear_QNet(state_size, hidden_size, action_size)
-        self.target_model.load_state_dict(self.model.state_dict())  # copy weight ban đầu
-
-        self.trainer = QTrainer(
-            self.model, lr=LR, gamma=self.gamma, target_model=self.target_model
-        )
-
-    def get_state(self, env):
-        """Sinh state 11 chiều giống Patrick"""
-        head_x, head_y = env.snake.head.x, env.snake.head.y
-        dir = env.snake.direction
-
-        # Các điểm liền kề
-        point_l = (head_x - 1, head_y)
-        point_r = (head_x + 1, head_y)
-        point_u = (head_x, head_y - 1)
-        point_d = (head_x, head_y + 1)
-
-        dir_l = dir == 2
-        dir_r = dir == 3
-        dir_u = dir == 0
-        dir_d = dir == 1
-
-        def collision(p):
-            x, y = p
-            # check tường
-            if x < 0 or x >= env.snake.blocks_x or y < 0 or y >= env.snake.blocks_y:
-                return True
-            # check thân
-            for b in env.snake.body:
-                if (b.x, b.y) == (x, y):
-                    return True
-            return False
-
-        state = [
-            # Danger straight
-            (dir_r and collision(point_r))
-            or (dir_l and collision(point_l))
-            or (dir_u and collision(point_u))
-            or (dir_d and collision(point_d)),
-
-            # Danger right
-            (dir_u and collision(point_r))
-            or (dir_d and collision(point_l))
-            or (dir_l and collision(point_u))
-            or (dir_r and collision(point_d)),
-
-            # Danger left
-            (dir_d and collision(point_r))
-            or (dir_u and collision(point_l))
-            or (dir_r and collision(point_u))
-            or (dir_l and collision(point_d)),
-
-            # Move direction
-            dir_l,
-            dir_r,
-            dir_u,
-            dir_d,
-
-            # Food location
-            env.snake.food.block.x < env.snake.head.x,  # food left
-            env.snake.food.block.x > env.snake.head.x,  # food right
-            env.snake.food.block.y < env.snake.head.y,  # food up
-            env.snake.food.block.y > env.snake.head.y,  # food down
-        ]
-
-        return np.array(state, dtype=int)
-
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-
-    def train_long_memory(self):
-        if len(self.memory) > BATCH_SIZE:
-            mini_sample = random.sample(self.memory, BATCH_SIZE)
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
         else:
-            mini_sample = self.memory
+            self.buffer[self.pos] = transition
 
-        states, actions, rewards, next_states, dones = zip(*mini_sample)
-        self.trainer.train_step(states, actions, rewards, next_states, dones)
+        self.priorities[self.pos] = prio ** self.alpha
+        self.pos = (self.pos + 1) % self.capacity
 
-    def train_short_memory(self, state, action, reward, next_state, done):
-        self.trainer.train_step(state, action, reward, next_state, done)
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == 0:
+            return [], [], None, None
 
-    # def get_action(self, state):
-    #     """epsilon-greedy chọn action"""
-    #     self.epsilon = 80 - self.n_games
-    #     final_move = [0, 0, 0]
-    #     if random.randint(0, 200) < self.epsilon:
-    #         move = random.randint(0, 2)
-    #         final_move[move] = 1
-    #     else:
-    #         state0 = torch.tensor(state, dtype=torch.float)
-    #         prediction = self.model(state0)
-    #         move = torch.argmax(prediction).item()
-    #         final_move[move] = 1
-    #     return final_move
+        prios = self.priorities[: len(self.buffer)]
+        probs = prios / prios.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[i] for i in indices]
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights = weights / (weights.max() + 1e-8)
+        weights = torch.tensor(weights, dtype=torch.float32)
+
+        return samples, indices, weights, probs
+
+    def update_priorities(self, indices, errors):
+        for idx, err in zip(indices, errors):
+            prio = abs(err) + 1e-6
+            self.priorities[idx] = prio ** self.alpha
+
+    def __len__(self):
+        return len(self.buffer)
+
+# =========================
+# Agent
+# =========================
+class Agent:
+    def __init__(self,
+                 state_size=STATE_SIZE,
+                 hidden_size=HIDDEN_SIZE,
+                 action_size=ACTION_SIZE,
+                 lr=LR,
+                 gamma=GAMMA,
+                 memory_capacity=MAX_MEMORY):
+        self.n_games = 0
+        self.gamma = gamma
+
+        # epsilon control
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.99995
+        self.step_count = 0
+
+        # replay memory
+        self.memory = PrioritizedReplayBuffer(capacity=memory_capacity, alpha=0.6)
+
+        # models
+        self.model = Linear_QNet(state_size, hidden_size, action_size)
+        self.target_model = Linear_QNet(state_size, hidden_size, action_size)
+        self.target_model.load_state_dict(self.model.state_dict())
+
+        self.trainer = QTrainer(self.model, lr=lr, gamma=self.gamma,
+                                target_model=self.target_model, tau=0.01)
+
+        self.batch_size = BATCH_SIZE
+        self.beta_start = 0.4
+        self.beta_frames = 200000
+
+    def remember(self, state, action, reward, next_state, done, error=None):
+        self.memory.push((state, action, reward, next_state, done), error=error)
+
     def get_action(self, state):
-        """epsilon-greedy chọn action với exponential decay"""
-        epsilon_min = 0.01
-        decay_rate = 0.995
-        self.epsilon = max(epsilon_min, self.epsilon * decay_rate) if self.n_games > 0 else 1.0
+        self.step_count += 1
+        if self.step_count > 1:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
         final_move = [0, 0, 0]
-        if random.random() < self.epsilon:  # exploration
+        if random.random() < self.epsilon:
             move = random.randint(0, 2)
             final_move[move] = 1
-        else:  # exploitation
+        else:
             state0 = torch.tensor(state, dtype=torch.float)
             prediction = self.model(state0)
             move = torch.argmax(prediction).item()
             final_move[move] = 1
         return final_move
 
+    def train_long_memory(self):
+        if len(self.memory) < self.batch_size:
+            return
+        beta = min(1.0, self.beta_start +
+                   (1.0 - self.beta_start) * (self.step_count / self.beta_frames))
+        mini_sample, indices, weights, _ = self.memory.sample(self.batch_size, beta=beta)
+        states, actions, rewards, next_states, dones = zip(*mini_sample)
 
+        loss, td_errors = self.trainer.train_step(states, actions, rewards,
+                                                  next_states, dones, weights=weights)
+        td_errs_np = td_errors.detach().cpu().numpy()
+        self.memory.update_priorities(indices, td_errs_np)
+        return loss
 
+    def train_short_memory(self, state, action, reward, next_state, done):
+        loss, td_errors = self.trainer.train_step([state], [action], [reward],
+                                                  [next_state], [done], weights=None)
+        try:
+            err = td_errors.detach().cpu().numpy()[0]
+        except Exception:
+            err = None
+        self.remember(state, action, reward, next_state, done, error=err)
+        return loss
+
+# =========================
+# Helpers
+# =========================
 def action_to_direction(action, current_dir):
-    """
-    Map từ action 3 chiều (straight, right, left)
-    sang 4 hướng (0: up, 1: down, 2: left, 3: right).
-    """
-    clock_wise = [0, 3, 1, 2]  # up, right, down, left
+    # clockwise order = [0,3,1,2] (up, right, down, left)
+    clock_wise = [0, 3, 1, 2]
     idx = clock_wise.index(current_dir)
-
     if np.array_equal(action, [1, 0, 0]):  # straight
         new_dir = clock_wise[idx]
-    elif np.array_equal(action, [0, 1, 0]):  # right turn
+    elif np.array_equal(action, [0, 1, 0]):  # right
         new_dir = clock_wise[(idx + 1) % 4]
-    else:  # left turn
+    else:  # left
         new_dir = clock_wise[(idx - 1) % 4]
     return new_dir
 
+# =========================
+# Training Loop
+# =========================
+def train(num_episodes=3000, phase=1, load_model=False, model_path="dqn_snake_per.pth"):
+    if phase == 1:
+        w, h = 10, 10
+    elif phase == 2:
+        w, h = 15, 15
+    elif phase == 3:
+        w, h = 25, 25
+    else:
+        raise ValueError("Phase chỉ nhận 1, 2 hoặc 3")
 
-def train():
     options = {
         "fps": 0,
-        "max_step": 200,
+        "max_step": 600,
         "init_length": 3,
-        "food_reward": 1.0,
-        "dist_reward": 0.0,
-        "living_bonus": 0.0,
-        "death_penalty": -1.0,
-        "width": 10,
-        "height": 10,
+        "food_reward": 10.0,
+        "dist_reward": 1.0,
+        "living_bonus": -0.01,
+        "death_penalty": -50.0,
+        "width": w,
+        "height": h,
         "block_size": 20,
     }
+
     env = SnakeEnv(render_mode=None, **options)
-    agent = Agent()
+    agent = Agent(state_size=STATE_SIZE,
+                  hidden_size=HIDDEN_SIZE,
+                  action_size=ACTION_SIZE,
+                  lr=LR,
+                  gamma=GAMMA)
+
+    device = torch.device("cuda" if (load_model and torch.cuda.is_available()) else "cpu")
+    if load_model and model_path:
+        try:
+            print(f"Loading model from {model_path} ...")
+            agent.model.load_state_dict(torch.load(model_path, map_location=device))
+            agent.target_model.load_state_dict(agent.model.state_dict())
+        except Exception as e:
+            print(f"Could not load model: {e}. Starting fresh.")
+
     record = 0
-    for episode in range(500):  # train 500 games
-        env.reset()  # reset môi trường
-        state_old = agent.get_state(env)
-        done = False
-        truncated = False
-        total_reward = 0
+    for episode in range(1, num_episodes + 1):
+        obs, info = env.reset()
+        state_old = np.array(obs, dtype=float)
+
+        done, truncated = False, False
+        total_reward = 0.0
+
         while not (done or truncated):
             final_move = agent.get_action(state_old)
             action_idx = action_to_direction(final_move, env.snake.direction)
 
-            next_state, reward, done, truncated, _ = env.step(action_idx)
-            state_new = agent.get_state(env)
+            next_obs, reward, done, truncated, _ = env.step(action_idx)
+            state_new = np.array(next_obs, dtype=float)
 
             agent.train_short_memory(state_old, final_move, reward, state_new, done)
-            agent.remember(state_old, final_move, reward, state_new, done)
-
             state_old = state_new
             total_reward += reward
 
         agent.n_games += 1
-        agent.train_long_memory()
+        loss = agent.train_long_memory()
         agent.trainer.soft_update_target()
 
         if env.snake.score > record:
             record = env.snake.score
-            agent.model.save("dqn_snake_3actions.pth")
+            agent.model.save(f"dqn_snake_phase{phase}.pth")
 
         print(
-            f"Game {agent.n_games}, Score: {env.snake.score}, Record: {record}, Reward: {total_reward}"
+            f"Episode {episode}/{num_episodes} | Score: {env.snake.score} | Record: {record} | Reward: {total_reward:.3f} | Eps: {agent.epsilon:.4f} | Loss: {loss if loss is not None else 'N/A'}"
         )
 
     env.close()
 
 
 if __name__ == "__main__":
-    
-    train()
-    
+    train(num_episodes=20000, phase=2,
+          load_model=True,
+          model_path="D:\\AL_FINAL_PROJECT_LAST_WEEK\\AI_LAST_VER\\model\\dqn_snake_per.pth")
