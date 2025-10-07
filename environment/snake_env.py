@@ -5,7 +5,7 @@ from .core import Snake
 
 
 class SnakeEnv(gym.Env):
-    metadata = {"render_modes": ["human", "ansi"], "render_fps": 30}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     def __init__(self, render_mode=None, **kwargs) -> None:
         self.render_mode = render_mode
@@ -38,15 +38,17 @@ class SnakeEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.snake.init()
+        # FIX: Gọi trực tiếp snake.render() thay vì _render_frame()
         if self.render_mode == "human":
-            self._render_frame()
+            self.snake.render()
         return self._get_obs(), self._get_info()
 
     def step(self, action):
         obs, reward, dead, truncated = self.snake.step(action)
         terminated = dead
+        # FIX: Gọi trực tiếp snake.render() thay vì _render_frame()
         if self.render_mode == "human":
-            self._render_frame()
+            self.snake.render()
         return obs, reward, terminated, truncated, self._get_info()
 
     def _get_obs(self):
@@ -55,8 +57,11 @@ class SnakeEnv(gym.Env):
     def _get_info(self):
         return self.snake.info()
 
-    def _render_frame(self):
-        self.snake.render()
+    def render(self):
+        """Gymnasium render method"""
+        if self.render_mode == "human":
+            self.snake.render()
+        return None
 
     def close(self):
         self.snake.close()
