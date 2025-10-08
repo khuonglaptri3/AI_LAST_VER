@@ -34,14 +34,7 @@ class QTrainer:
         self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
 
     def train_step(self, state, action, reward, next_state, done, weights=None):
-        """
-        state: [B, state_dim]
-        action: [B] (int)
-        reward: [B]
-        next_state: [B, state_dim]
-        done: [B]
-        weights: [B] (PER IS weights) hoặc None
-        """
+
         device = next(self.model.parameters()).device
         state = torch.tensor(state, dtype=torch.float, device=device)
         next_state = torch.tensor(next_state, dtype=torch.float, device=device)
